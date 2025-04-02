@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Complex Minimal RTS</title>
+<style>
+  body { margin: 0; overflow: hidden; background-color: #333; color: white; font-family: sans-serif; }
+  canvas { display: block; background-color: #5a5a5a; }
+  #ui { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px; }
+  #controls { position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px; min-width: 200px; min-height: 50px;}
+  button { margin: 2px; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div>Minerals: <span id="minerals">0</span> | Gas: <span id="gas">0</span></div>
+  <div>Supply: <span id="supply">0</span> / <span id="maxSupply">0</span></div>
+  <div id="message">Select a unit or building. Right-click to command.</div>
+</div>
+
+<div id="controls">
+  <div id="selectionInfo">Nothing selected</div>
+  <div id="actions"></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+// --- Game Constants ---
+const TILE_SIZE = 32; // Not really used for rendering, but conceptually useful
+const MINERAL_COLOR = '#FFFF00';
+const GAS_COLOR = '#00FF00';
+const PLAYER_COLOR = '#007bff';
+const ENEMY_COLOR = '#dc3545';
+const SELECTION_COLOR = '#FFFFFF';
+const HEALTH_BAR_COLOR = '#FF0000';
+const HEALTH_BAR_BG_COLOR = '#555555';
+const RESOURCE_SIZE = 15;
+const BASE_SIZE = 60;
+const BARRACKS_SIZE = 40;
+const WORKER_SIZE = 8;
+const SOLDIER_SIZE = 10;
+const GATHER_RANGE = 40;
+const ATTACK_RANGE = 50;
+const UNIT_SPEED = 1;
+const AI_ATTACK_INTERVAL = 30000; // ms (30 seconds)
+const AI_BUILD_CHECK_INTERVAL = 5000; // ms (5 seconds)
+
+// --- Game State ---
+let canvas, ctx;
+let minerals = 100;
+let gas = 50;
+let supply = 0;
+let maxSupply = 0;
+let gameObjects = [];
+let selectedObject = null;
+let lastTimestamp = 0;
+let aiState = {
+  minerals: 100,
+  gas: 50,
+  supply: 0,
+  maxSupply: 0,
+  lastAttackTime: 0,
+  lastBuildCheckTime: 0,
+  targetBase: null // Player's base
+};
+let gameOver = false;
+let gameWon = false;
+
+// --- Utility Functions ---
+function distSq(x1, y1, x2, y2) {
+  const dx = x1 - x2;
+  const dy = y1 - y2;
+  return dx * dx + dy * dy;
+}
+
+function isEnemy(obj1, obj2) {
+    return obj1 && obj2 && obj1.isPlayer !== obj2.isPlayer;
+}
+
+function findClosest(x, y, objects, filterFn) {
+    let closest = null;
+    let minDistSq = Infinity;
+    for (const obj of objects) {
+        if (filterFn(obj)) {
+            const dSq = distSq(x, y, obj.x, obj.y);
+            if (dSq < minDistSq) {
+                minDistSq = dSq;
+                closest = obj;
+            }
+        }
+    }
+    return { object: closest, distanceSq: minDistSq };
+}
+
+// --- Classes ---
+class GameObject {
+  constructor(x, y, size, hp, isPlayer) {
+    this.id = Math.random().toString(36).substr(2, 9); // Simple unique ID
+    this.x = x;
+    this.y = y;
+    this.size = size;
+    this.maxHp = hp;
+    this.hp = hp;
+    this.isPlayer = isPlayer;
+    this.target = null; // Can be coordinates {x, y} or another GameObject
+    this.state = 'idle'; // idle, moving, gathering, attacking, constructing, producing
+    this.selected = false;
+  }
+
+  update(deltaTime, gameObjects) {
+    // Basic movement
+    if (this.state === 'moving' && this.target && typeof this.target.x === 'number') {
+      const dx = this.target.x - this.x;
+      const dy = this.target.y - this.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < this.size / 2) {
+        this.state = 'idle';
+        this.target = null;
+      } else {
+        this.x += (dx / dist) * UNIT_SPEED * (deltaTime / 16); // Normalize time
+        this.y += (dy / dist) * UNIT_SPEED * (deltaTime / 16);
+      }
+    }
+  }
+
+  draw(ctx) {
+    // Basic shape - override in subclasses
+    ctx.fillStyle = this.isPlayer ? PLAYER_COLOR : ENEMY_COLOR;
+    ctx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+
+    // Health bar
+    if (this.hp < this.maxHp) {
+        const barWidth = this.size;
+        const barHeight = 5;
+        const barY = this.y - this.size / 2 - barHeight - 2;
+        ctx.fillStyle = HEALTH_BAR_BG_COLOR;
+        ctx.fillRect(this.x - barWidth / 2, barY, barWidth, barHeight);
+        ctx.fillStyle = HEALTH_BAR_COLOR;
+        ctx.fillRect(this.x - barWidth / 2, barY, barWidth * (this.hp / this.maxHp), barHeight);
+    }
+
+
+    // Selection indicator
+    if (this.selected) {
+      ctx.strokeStyle = SELECTION_COLOR;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(this.x - this.size / 2 - 2, this.y - this.size / 2 - 2, this.size + 4, this.size + 4);
+    }
+  }
+
+  distanceTo(target) {
+      const dx = this.x - target.x;
+      const dy = this.y - target.y;
+      return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  findTargetInRange(objects, range, filterFn) {
+      let closestTarget = null;
+      let minTargetDistSq = range * range;
+
+      for(const obj of objects) {
+          if (filterFn(obj)) {
+              const dSq = distSq(this.x, this.y, obj.x, obj.y);
+              if (dSq < minTargetDistSq) {
+                  minTargetDistSq = dSq;
+                  closestTarget = obj;
+              }
+          }
+      }
+      return closestTarget;
+  }
+
+  takeDamage(amount) {
+      this.hp -= amount;
+      if (this.hp <= 0) {
+          this.destroy();
+      }
+  }
+
+  destroy() {
+      // Find and remove self from gameObjects
+      const index = gameObjects.findIndex(obj => obj.id === this.id);
+      if (index > -1) {
+          // Adjust supply if it was a unit
+          if (this instanceof Unit) {
+             if (this.isPlayer) {
+                 supply -= this.supplyCost;
+             } else {
+                 aiState.supply -= this.supplyCost;
+             }
+          }
+          // Adjust max supply if it was a base
+          if (this instanceof Base) {
+              if (this.isPlayer) {
+                  maxSupply -= this.supplyProvided;
+                  gameWon = false; // Player base destroyed
+                  gameOver = true;
+              } else {
+                  aiState.maxSupply -= this.supplyProvided;
+                  gameWon = true; // Enemy base destroyed
+                  gameOver = true;
+              }
+          }
+
+          gameObjects.splice(index, 1);
+          if (selectedObject === this) {
+              deselect();
+          }
+      }
+  }
+}
+
+class ResourceNode extends GameObject {
+    constructor(x, y, type, amount) {
+        super(x, y, RESOURCE_SIZE, 1000, true); // HP represents amount, player=true just for color
+        this.type = type; // 'mineral' or 'gas'
+        this.amount = amount;
+        this.hp = amount; // Use hp to track amount
+    }
+
+    gather(amount) {
+        const gathered = Math.min(amount, this.amount);
+        this.amount -= gathered;
+        this.hp = this.amount; // Update visual hp
+        if (this.amount <= 0) {
+            this.destroy();
+        }
+        return gathered;
+    }
+
+    draw(ctx) {
+        ctx.fillStyle = this.type === 'mineral' ? MINERAL_COLOR : GAS_COLOR;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        // Optionally draw amount text
+         ctx.fillStyle = '#000';
+         ctx.font = '10px sans-serif';
+         ctx.textAlign = 'center';
+         ctx.fillText(this.amount, this.x, this.y + 4);
+    }
+
+     destroy() { // Override destroy to not affect supply
+        const index = gameObjects.findIndex(obj => obj.id === this.id);
+        if (index > -1) {
+            gameObjects.splice(index, 1);
+             if (selectedObject === this) {
+                deselect();
+            }
+        }
+    }
+}
+
+
+class Building extends GameObject {
+    constructor(x, y, size, hp, isPlayer, supplyProvided = 0) {
+        super(x, y, size, hp, isPlayer);
+        this.productionQueue = [];
+        this.productionProgress = 0;
+        this.supplyProvided = supplyProvided;
+         if (isPlayer) maxSupply += supplyProvided; else aiState.maxSupply += supplyProvided;
+    }
+
+    update(deltaTime, gameObjects) {
+        super.update(deltaTime, gameObjects);
+        // Production
+        if (this.productionQueue.length > 0) {
+            const item = this.productionQueue[0];
+            this.productionProgress += deltaTime;
+            if (this.productionProgress >= item.cost.time) {
+                this.spawnUnit(item.unitType);
+                this.productionProgress = 0;
+                this.productionQueue.shift(); // Remove first item
+            }
+        }
+         // Check if AI base needs to target player base
+         if (!this.isPlayer && this instanceof Base && !aiState.targetBase) {
+             const playerBase = gameObjects.find(o => o instanceof Base && o.isPlayer);
+             if(playerBase) aiState.targetBase = playerBase;
+         }
+    }
+
+    queueUnit(unitType) {
+        const costs = getUnitCost(unitType);
+        const currentSupply = this.isPlayer ? supply : aiState.supply;
+        const currentMaxSupply = this.isPlayer ? maxSupply : aiState.maxSupply;
+
+        if (currentSupply + costs.supply > currentMaxSupply) {
+            setMessage(this.isPlayer ? "Not enough supply!" : "AI: Not enough supply");
+            return false; // Not enough supply
+        }
+
+         // Check resources (handle AI separately)
+        if (this.isPlayer) {
+            if (minerals >= costs.minerals && gas >= costs.gas) {
+                minerals -= costs.minerals;
+                gas -= costs.gas;
+                 supply += costs.supply;
+                this.productionQueue.push({ unitType: unitType, cost: costs });
+                return true;
+            } else {
+                setMessage("Not enough resources!");
+                return false;
+            }
+        } else {
+             if (aiState.minerals >= costs.minerals && aiState.gas >= costs.gas) {
+                aiState.minerals -= costs.minerals;
+                aiState.gas -= costs.gas;
+                aiState.supply += costs.supply;
+                this.productionQueue.push({ unitType: unitType, cost: costs });
+                return true;
+            } else {
+                // AI failed to build (should have checked before calling)
+                return false;
+            }
+        }
+    }
+
+    spawnUnit(unitType) {
+        // Spawn adjacent to building
+        const spawnOffset = this.size / 2 + (unitType === 'Worker' ? WORKER_SIZE : SOLDIER_SIZE) + 5;
+        const spawnAngle = Math.random() * Math.PI * 2;
+        const spawnX = this.x + Math.cos(spawnAngle) * spawnOffset;
+        const spawnY = this.y + Math.sin(spawnAngle) * spawnOffset;
+
+        let newUnit;
+        if (unitType === 'Worker') {
+            newUnit = new Worker(spawnX, spawnY, this.isPlayer);
+        } else if (unitType === 'Soldier') {
+            newUnit = new Soldier(spawnX, spawnY, this.isPlayer);
+        }
+
+        if (newUnit) {
+             // Check bounds (simple clamp)
+            newUnit.x = Math.max(newUnit.size/2, Math.min(canvas.width - newUnit.size/2, newUnit.x));
+            newUnit.y = Math.max(newUnit.size/2, Math.min(canvas.height - newUnit.size/2, newUnit.y));
+            gameObjects.push(newUnit);
+        }
+    }
+
+     draw(ctx) {
+        super.draw(ctx); // Draw basic shape and health
+
+        // Draw production progress bar
+        if (this.productionQueue.length > 0) {
+            const item = this.productionQueue[0];
+            const progress = this.productionProgress / item.cost.time;
+            const barWidth = this.size * 0.8;
+            const barHeight = 6;
+            const barY = this.y + this.size / 2 + 3; // Below the building
+            ctx.fillStyle = '#444';
+            ctx.fillRect(this.x - barWidth / 2, barY, barWidth, barHeight);
+            ctx.fillStyle = '#FFF';
+            ctx.fillRect(this.x - barWidth / 2, barY, barWidth * progress, barHeight);
+        }
+    }
+}
+
+class Base extends Building {
+    constructor(x, y, isPlayer) {
+        super(x, y, BASE_SIZE, 1000, isPlayer, 10); // Provides 10 supply
+    }
+    draw(ctx) {
+        ctx.fillStyle = this.isPlayer ? PLAYER_COLOR : ENEMY_COLOR;
+        ctx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+        ctx.fillStyle = '#FFF'; // Inner square maybe
+        ctx.fillRect(this.x - this.size / 4, this.y - this.size / 4, this.size/2, this.size/2);
+        super.draw(ctx); // Draw health/selection
+    }
+}
+
+class Barracks extends Building {
+    constructor(x, y, isPlayer) {
+        super(x, y, BARRACKS_SIZE, 500, isPlayer, 0); // Provides 0 supply
+    }
+     draw(ctx) {
+        ctx.fillStyle = this.isPlayer ? PLAYER_COLOR : ENEMY_COLOR;
+        ctx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+        ctx.strokeStyle = '#FFF'; // Outline maybe
+        ctx.lineWidth = 2;
+        ctx.strokeRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+        super.draw(ctx); // Draw health/selection
+    }
+}
+
+
+class Unit extends GameObject {
+    constructor(x, y, size, hp, isPlayer, damage, attackRate, supplyCost) {
+        super(x, y, size, hp, isPlayer);
+        this.damage = damage;
+        this.attackRate = attackRate; // ms per attack
+        this.lastAttackTime = 0;
+        this.supplyCost = supplyCost;
+        this.gatherTarget = null; // ResourceNode
+        this.attackTarget = null; // GameObject
+        this.returnTarget = null; // Base building
+        this.carriedResource = null; // 'mineral' or 'gas'
+        this.carryAmount = 0;
+        this.maxCarry = 10;
+    }
+
+    update(deltaTime, gameObjects) {
+         // Reset attack target if it's gone or friendly
+        if (this.attackTarget && (this.attackTarget.hp <= 0 || !isEnemy(this, this.attackTarget))) {
+            this.attackTarget = null;
+            if (this.state === 'attacking') this.state = 'idle';
+        }
+         // Reset gather target if it's gone
+        if (this.gatherTarget && this.gatherTarget.amount <= 0) {
+             this.gatherTarget = null;
+             if (this.state === 'gathering') {
+                 // If carrying something, return it, otherwise idle
+                 if (this.carryAmount > 0) {
+                     this.findAndSetReturnTarget(gameObjects);
+                     this.state = 'returning';
+                 } else {
+                     this.state = 'idle';
+                 }
+             }
+        }
+
+
+        // State machine
+        switch(this.state) {
+            case 'idle':
+                // Soldiers should auto-attack if enemy in range
+                 if (this instanceof Soldier) {
+                    const enemy = this.findTargetInRange(gameObjects, ATTACK_RANGE, obj => isEnemy(this, obj) && (obj instanceof Unit || obj instanceof Building));
+                    if(enemy) {
+                        this.attackTarget = enemy;
+                        this.state = 'attacking';
+                    }
+                 }
+                break;
+            case 'moving':
+                const targetX = this.target?.x;
+                const targetY = this.target?.y;
+                 if (targetX === undefined || targetY === undefined) {
+                     this.state = 'idle'; // Invalid target somehow
+                     break;
+                 }
+                const dx = targetX - this.x;
+                const dy = targetY - this.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                // Use a small tolerance for arrival, consider unit size
+                const arrivalThreshold = UNIT_SPEED * (deltaTime / 16) + this.size / 2;
+
+                if (dist < arrivalThreshold) {
+                    this.state = 'idle';
+                    this.target = null;
+                } else {
+                    this.x += (dx / dist) * UNIT_SPEED * (deltaTime / 16);
+                    this.y += (dy / dist) * UNIT_SPEED * (deltaTime / 16);
+                }
+                break;
+            case 'gathering':
+                if (!this.gatherTarget || this.gatherTarget.amount <= 0) {
+                     this.state = 'idle';
+                     this.findAndSetReturnTarget(gameObjects); // Try returning if carrying
+                     if (this.returnTarget) this.state = 'returning';
+                     break;
+                }
+                if (this.distanceTo(this.gatherTarget) < GATHER_RANGE) {
+                    // At resource node
+                    if (this.carryAmount < this.maxCarry) {
+                         // Simulate gathering time - simplistic approach
+                        this.lastAttackTime += deltaTime; // Re-use lastAttackTime for gather timer
+                         if (this.lastAttackTime > 1000) { // 1 second to gather
+                            const gathered = this.gatherTarget.gather(1); // Gather 1 unit at a time
+                            if(gathered > 0){
+                                this.carriedResource = this.gatherTarget.type;
+                                this.carryAmount += gathered;
+                            } else {
+                                // Node depleted while gathering
+                                this.gatherTarget = null;
+                                this.state = 'idle'; // Go idle or find new node? Simple: idle.
+                            }
+                             this.lastAttackTime = 0; // Reset timer
+                         }
+                    }
+                    if (this.carryAmount >= this.maxCarry) {
+                        // Full, find base to return to
+                         this.findAndSetReturnTarget(gameObjects);
+                        if(this.returnTarget) {
+                            this.state = 'returning';
+                            this.target = this.returnTarget; // Move towards base
+                        } else {
+                            this.state = 'idle'; // No base found? Idle.
+                        }
+                    }
+                } else {
+                     // Move towards resource
+                     this.target = this.gatherTarget; // Use the object itself as target
+                     this.moveTowardsTarget(deltaTime);
+                 }
+                break;
+            case 'returning':
+                 if (!this.returnTarget || this.returnTarget.hp <= 0) {
+                     // Base destroyed? Find another or go idle
+                     this.findAndSetReturnTarget(gameObjects);
+                     if (!this.returnTarget) {
+                         this.state = 'idle';
+                         this.carryAmount = 0; // Drop resources
+                         this.carriedResource = null;
+                         break;
+                     }
+                 }
+                if (this.distanceTo(this.returnTarget) < GATHER_RANGE) { // Use GATHER_RANGE for drop-off
+                    // At base, drop resources
+                    if (this.isPlayer) {
+                        if (this.carriedResource === 'mineral') minerals += this.carryAmount;
+                        else if (this.carriedResource === 'gas') gas += this.carryAmount;
+                    } else {
+                         if (this.carriedResource === 'mineral') aiState.minerals += this.carryAmount;
+                        else if (this.carriedResource === 'gas') aiState.gas += this.carryAmount;
+                    }
+                    this.carryAmount = 0;
+                    this.carriedResource = null;
+
+                    // Go back to gathering the same node if possible, else idle
+                    if (this.gatherTarget && this.gatherTarget.amount > 0) {
+                        this.state = 'gathering';
+                        this.target = this.gatherTarget;
+                    } else {
+                         this.state = 'idle';
+                         this.gatherTarget = null; // Clear target if it was depleted
+                    }
+                    this.returnTarget = null;
+
+                } else {
+                    // Move towards base
+                    this.target = this.returnTarget;
+                    this.moveTowardsTarget(deltaTime);
+                }
+                break;
+            case 'attacking':
+                 if (!this.attackTarget || this.attackTarget.hp <= 0 || !isEnemy(this, this.attackTarget)) {
+                    this.state = 'idle';
+                    this.attackTarget = null;
+                    break;
+                }
+
+                if (this.distanceTo(this.attackTarget) <= ATTACK_RANGE) {
+                    // In range, attack
+                    this.target = null; // Stop moving
+                    this.lastAttackTime += deltaTime;
+                    if (this.lastAttackTime >= this.attackRate) {
+                        this.attackTarget.takeDamage(this.damage);
+                        this.lastAttackTime = 0;
+                         // Simple target lost check after attacking
+                         if (this.attackTarget.hp <= 0) {
+                             this.attackTarget = null;
+                             this.state = 'idle';
+                         }
+                    }
+                } else {
+                    // Move towards target
+                    this.target = this.attackTarget;
+                    this.moveTowardsTarget(deltaTime);
+                }
+                break;
+        }
+    }
+
+    moveTowardsTarget(deltaTime) {
+         if (!this.target) return;
+         const targetX = this.target.x;
+         const targetY = this.target.y;
+          if (targetX === undefined || targetY === undefined) return; // Target might be coords sometimes
+
+         const dx = targetX - this.x;
+         const dy = targetY - this.y;
+         const dist = Math.sqrt(dx * dx + dy * dy);
+         // Check if already close enough (prevents jittering)
+         // Use a slightly larger threshold for moving towards dynamic targets
+         const arrivalThreshold = UNIT_SPEED * (deltaTime / 16) + this.size / 2 + 2;
+         if (dist > arrivalThreshold) { // Only move if not already very close
+             this.x += (dx / dist) * UNIT_SPEED * (deltaTime / 16);
+             this.y += (dy / dist) * UNIT_SPEED * (deltaTime / 16);
+         }
+     }
+
+     findAndSetReturnTarget(gameObjects) {
+        const { object: closestBase } = findClosest(this.x, this.y, gameObjects,
+            obj => obj instanceof Base && obj.isPlayer === this.isPlayer
+        );
+        this.returnTarget = closestBase;
+     }
+
+    command(targetObject, targetPos, gameObjects) {
+        if (targetObject) { // Clicked on an object
+            if (targetObject instanceof ResourceNode && this instanceof Worker) {
+                this.gatherTarget = targetObject;
+                this.state = 'gathering';
+                this.attackTarget = null;
+                this.target = targetObject; // Move towards it initially
+            } else if (targetObject instanceof Base && this instanceof Worker && this.carryAmount > 0) {
+                 this.returnTarget = targetObject;
+                 this.state = 'returning';
+                 this.target = targetObject;
+            }
+            else if (isEnemy(this, targetObject) && (this instanceof Soldier)) {
+                this.attackTarget = targetObject;
+                this.gatherTarget = null;
+                this.state = 'attacking';
+                this.target = targetObject; // Move towards it initially
+            } else {
+                 // Move command towards friendly unit/building (or invalid target)
+                 this.state = 'moving';
+                 this.target = {x: targetObject.x, y: targetObject.y};
+                 this.gatherTarget = null;
+                 this.attackTarget = null;
+            }
+
+        } else if (targetPos) { // Clicked on the ground
+            this.state = 'moving';
+            this.target = targetPos;
+            this.gatherTarget = null;
+            this.attackTarget = null;
+        }
+    }
+
+    draw(ctx) {
+        super.draw(ctx); // Draws basic shape, health, selection
+
+         // Draw carried resource indicator for Worker
+         if (this instanceof Worker && this.carryAmount > 0) {
+             ctx.fillStyle = this.carriedResource === 'mineral' ? MINERAL_COLOR : GAS_COLOR;
+             ctx.beginPath();
+             ctx.arc(this.x + this.size * 0.3, this.y - this.size * 0.3, this.size * 0.4, 0, Math.PI * 2);
+             ctx.fill();
+         }
+    }
+}
+
+class Worker extends Unit {
+    constructor(x, y, isPlayer) {
+        super(x, y, WORKER_SIZE, 50, isPlayer, 2, 1500, 1); // 1 supply
+    }
+     draw(ctx) {
+        // Draw as circle maybe
+        ctx.fillStyle = this.isPlayer ? PLAYER_COLOR : ENEMY_COLOR;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size / 2, 0, Math.PI * 2);
+        ctx.fill();
+        if (this.hp < this.maxHp) super.draw(ctx); // Call super only for health/selection if needed
+        else if (this.selected) super.draw(ctx);
+
+        // Draw carried resource indicator (copied from Unit.draw for simplicity here)
+         if (this.carryAmount > 0) {
+             ctx.fillStyle = this.carriedResource === 'mineral' ? MINERAL_COLOR : GAS_COLOR;
+             ctx.beginPath();
+             ctx.arc(this.x + this.size * 0.3, this.y - this.size * 0.3, this.size * 0.4, 0, Math.PI * 2);
+             ctx.fill();
+         }
+    }
+}
+
+class Soldier extends Unit {
+    constructor(x, y, isPlayer) {
+        super(x, y, SOLDIER_SIZE, 100, isPlayer, 10, 1000, 2); // 2 supply
+    }
+     draw(ctx) {
+        // Draw as square
+        ctx.fillStyle = this.isPlayer ? PLAYER_COLOR : ENEMY_COLOR;
+        ctx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+         if (this.hp < this.maxHp || this.selected) super.draw(ctx); // Draw health/selection overlay
+    }
+}
+
+// --- Cost Definitions ---
+function getUnitCost(unitType) {
+    switch (unitType) {
+        case 'Worker': return { minerals: 50, gas: 0, time: 10000, supply: 1 }; // 10 sec
+        case 'Soldier': return { minerals: 75, gas: 25, time: 15000, supply: 2 }; // 15 sec
+        default: return { minerals: 0, gas: 0, time: 0, supply: 0};
+    }
+}
+
+function getBuildingCost(buildingType) {
+     switch (buildingType) {
+        case 'Base': return { minerals: 400, gas: 0, time: 30000 }; // Only for initial placement info
+        case 'Barracks': return { minerals: 150, gas: 0, time: 20000 }; // 20 sec build time (handled by worker)
+        default: return { minerals: 0, gas: 0, time: 0 };
+    }
+}
+
+
+// --- Input Handling ---
+function handleClick(event) {
+    if (gameOver) return;
+    const rect = canvas.getBoundingClientRect();
+    const clickX = event.clientX - rect.left;
+    const clickY = event.clientY - rect.top;
+
+    let clickedObject = null;
+    // Check objects in reverse order (top ones first) - simple approach
+    for (let i = gameObjects.length - 1; i >= 0; i--) {
+        const obj = gameObjects[i];
+        const dx = clickX - obj.x;
+        const dy = clickY - obj.y;
+        // Simple circle collision for selection
+        if (dx * dx + dy * dy < (obj.size / 2) * (obj.size / 2)) {
+            clickedObject = obj;
+            break;
+        }
+    }
+
+    if (clickedObject && clickedObject.isPlayer) {
+        selectObject(clickedObject);
+    } else {
+         // If clicked empty space or enemy, deselect player object
+        deselect();
+    }
+}
+
+function handleRightClick(event) {
+     if (gameOver) return;
+    event.preventDefault(); // Prevent context menu
+    if (!selectedObject || !(selectedObject instanceof Unit)) return; // Only units can be commanded with right click
+
+    const rect = canvas.getBoundingClientRect();
+    const clickX = event.clientX - rect.left;
+    const clickY = event.clientY - rect.top;
+
+    let targetObject = null;
+     // Check objects in reverse order
+    for (let i = gameObjects.length - 1; i >= 0; i--) {
+        const obj = gameObjects[i];
+         // Don't target self
+         if (obj === selectedObject) continue;
+        const dx = clickX - obj.x;
+        const dy = clickY - obj.y;
+        if (dx * dx + dy * dy < (obj.size / 2) * (obj.size / 2)) {
+            targetObject = obj;
+            break;
+        }
+    }
+
+    selectedObject.command(targetObject, { x: clickX, y: clickY }, gameObjects);
+
+}
+
+function selectObject(obj) {
+    deselect(); // Deselect previous
+    selectedObject = obj;
+    selectedObject.selected = true;
+    updateControlsUI(); // Update the bottom UI panel
+}
+
+function deselect() {
+    if (selectedObject) {
+        selectedObject.selected = false;
+    }
+    selectedObject = null;
+    updateControlsUI(); // Clear the bottom UI panel
+}
+
+function setMessage(msg) {
+    document.getElementById('message').textContent = msg;
+     // Clear message after a delay
+     setTimeout(() => {
+          if (document.getElementById('message').textContent === msg) {
+              document.getElementById('message').textContent = ""; // Clear only if it wasn't overwritten
+          }
+     }, 3000);
+}
+
+// --- UI Update Functions ---
+function updateTopUI() {
+    document.getElementById('minerals').textContent = Math.floor(minerals);
+    document.getElementById('gas').textContent = Math.floor(gas);
+    document.getElementById('supply').textContent = supply;
+    document.getElementById('maxSupply').textContent = maxSupply;
+}
+
+function updateControlsUI() {
+    const infoDiv = document.getElementById('selectionInfo');
+    const actionsDiv = document.getElementById('actions');
+    actionsDiv.innerHTML = ''; // Clear actions
+
+    if (!selectedObject) {
+        infoDiv.textContent = 'Nothing selected';
+        return;
+    }
+
+    let infoText = `Selected: ${selectedObject.constructor.name}`;
+    if (selectedObject.hp) {
+         infoText += ` | HP: ${Math.ceil(selectedObject.hp)} / ${selectedObject.maxHp}`;
+    }
+    if (selectedObject instanceof Building && selectedObject.productionQueue.length > 0) {
+        const item = selectedObject.productionQueue[0];
+        const progress = Math.floor((selectedObject.productionProgress / item.cost.time) * 100);
+        infoText += ` | Training: ${item.unitType} (${progress}%)`;
+    }
+     if (selectedObject instanceof Worker && selectedObject.carryAmount > 0) {
+        infoText += ` | Carrying: ${selectedObject.carryAmount} ${selectedObject.carriedResource}`;
+    }
+
+
+    infoDiv.textContent = infoText;
+
+    // Add action buttons based on selection type
+    if (selectedObject instanceof Base) {
+        const cost = getUnitCost('Worker');
+        actionsDiv.innerHTML += `<button onclick="buildUnit('Worker')" title="Cost: ${cost.minerals}M ${cost.gas}G">Build Worker</button>`;
+    } else if (selectedObject instanceof Barracks) {
+         const cost = getUnitCost('Soldier');
+        actionsDiv.innerHTML += `<button onclick="buildUnit('Soldier')" title="Cost: ${cost.minerals}M ${cost.gas}G">Build Soldier</button>`;
+    }
+    // Add more actions for Workers (Build Barracks) later if desired
+}
+
+// --- Action Functions (called by buttons) ---
+function buildUnit(unitType) {
+    if (selectedObject && selectedObject instanceof Building) {
+        if(!selectedObject.queueUnit(unitType)){
+            // Message already set in queueUnit on failure
+        } else {
+             setMessage(`Training ${unitType}...`);
+             updateControlsUI(); // Update queue display
+             updateTopUI(); // Update resources/supply
+        }
+    }
+}
+
+// --- AI Logic ---
+function updateAI(deltaTime, gameObjects) {
+     if (gameOver) return;
+    aiState.lastBuildCheckTime += deltaTime;
+    aiState.lastAttackTime += deltaTime;
+
+    let aiBase = gameObjects.find(obj => obj instanceof Base && !obj.isPlayer);
+    let aiBarracks = gameObjects.find(obj => obj instanceof Barracks && !obj.isPlayer);
+    let aiWorkers = gameObjects.filter(obj => obj instanceof Worker && !obj.isPlayer);
+    let aiSoldiers = gameObjects.filter(obj => obj instanceof Soldier && !obj.isPlayer);
+
+    // --- Build Logic ---
+    if (aiState.lastBuildCheckTime >= AI_BUILD_CHECK_INTERVAL) {
+        aiState.lastBuildCheckTime = 0;
+
+         // 1. Build Workers if needed (simple ratio: < 5 workers initially)
+         if (aiBase && aiWorkers.length < 5 && aiBase.productionQueue.length === 0) {
+            const cost = getUnitCost('Worker');
+             if (aiState.minerals >= cost.minerals && aiState.supply + cost.supply <= aiState.maxSupply) {
+                 aiBase.queueUnit('Worker');
+                 // console.log("AI: Queued Worker");
+             }
+         }
+
+        // 2. Build Barracks if none exists and have enough workers/resources
+         if (aiBase && !aiBarracks && aiWorkers.length >= 3) {
+             const cost = getBuildingCost('Barracks');
+              if (aiState.minerals >= cost.minerals) {
+                 // Find an idle worker to build (simplistic: first one)
+                 const builder = aiWorkers.find(w => w.state === 'idle');
+                 if(builder) {
+                      // Simplification: Instantly build barracks near base, deduct cost
+                      // A real implementation would have the worker move and construct over time
+                      aiState.minerals -= cost.minerals;
+                      const offset = BASE_SIZE + BARRACKS_SIZE;
+                      const angle = Math.random() * Math.PI * 2;
+                      const bx = aiBase.x + Math.cos(angle) * offset;
+                      const by = aiBase.y + Math.sin(angle) * offset;
+                       // Clamp to bounds
+                       const clampedX = Math.max(BARRACKS_SIZE/2, Math.min(canvas.width - BARRACKS_SIZE/2, bx));
+                       const clampedY = Math.max(BARRACKS_SIZE/2, Math.min(canvas.height - BARRACKS_SIZE/2, by));
+                      gameObjects.push(new Barracks(clampedX, clampedY, false));
+                      // console.log("AI: Built Barracks");
+                      // Make builder idle again (since construction isn't simulated)
+                      builder.state = 'idle';
+                 }
+              }
+         }
+
+         // 3. Build Soldiers if Barracks exists
+         if (aiBarracks && aiBarracks.productionQueue.length === 0) {
+             const cost = getUnitCost('Soldier');
+             if (aiState.minerals >= cost.minerals && aiState.gas >= cost.gas && aiState.supply + cost.supply <= aiState.maxSupply) {
+                 aiBarracks.queueUnit('Soldier');
+                  // console.log("AI: Queued Soldier");
+             }
+         }
+    }
+
+    // --- Worker Assignment Logic ---
+    for (const worker of aiWorkers) {
+        if (worker.state === 'idle') {
+             // Prioritize minerals first, then gas if minerals are plenty
+             let targetResource = null;
+             if (aiState.minerals < 300 || aiState.gas > aiState.minerals / 2) { // Simple ratio check
+                 const { object: mineralNode } = findClosest(worker.x, worker.y, gameObjects, obj => obj instanceof ResourceNode && obj.type === 'mineral');
+                 targetResource = mineralNode;
+             } else {
+                  const { object: gasNode } = findClosest(worker.x, worker.y, gameObjects, obj => obj instanceof ResourceNode && obj.type === 'gas');
+                  targetResource = gasNode;
+                  // If no gas, fallback to minerals
+                  if (!targetResource) {
+                      const { object: mineralNode } = findClosest(worker.x, worker.y, gameObjects, obj => obj instanceof ResourceNode && obj.type === 'mineral');
+                      targetResource = mineralNode;
+                  }
+             }
+
+            if (targetResource) {
+                worker.command(targetResource, null, gameObjects);
+                 // console.log("AI: Worker going to gather", targetResource.type);
+            }
+        }
+    }
+
+
+    // --- Attack Logic ---
+    if (aiState.lastAttackTime >= AI_ATTACK_INTERVAL && aiSoldiers.length > 3) { // Need at least 4 soldiers to attack
+        aiState.lastAttackTime = 0;
+        const playerBase = gameObjects.find(o => o instanceof Base && o.isPlayer);
+
+        if (playerBase) {
+             // console.log("AI: Launching attack!");
+             for (const soldier of aiSoldiers) {
+                // Command all soldiers to attack the player's base
+                soldier.command(playerBase, null, gameObjects);
+             }
+        }
+    }
+     // Simple defense reaction for soldiers near base
+     if (aiBase) {
+         for (const soldier of aiSoldiers) {
+             if (soldier.state === 'idle' && soldier.distanceTo(aiBase) < 200) { // Idle near base
+                 const enemy = soldier.findTargetInRange(gameObjects, 150, obj => isEnemy(soldier, obj) && (obj instanceof Unit || obj instanceof Building));
+                 if (enemy) {
+                     soldier.command(enemy, null, gameObjects); // Attack nearby enemy
+                 }
+             }
+         }
+     }
+
+}
+
+
+// --- Game Loop ---
+function gameLoop(timestamp) {
+    const deltaTime = timestamp - lastTimestamp;
+    lastTimestamp = timestamp;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!gameOver) {
+        // Update AI
+        updateAI(deltaTime, gameObjects);
+
+        // Update all game objects
+        // Iterate backwards allow safe removal during iteration
+        for (let i = gameObjects.length - 1; i >= 0; i--) {
+            // Check if object still exists (might have been destroyed by another object's update)
+            if (gameObjects[i]) {
+                 gameObjects[i].update(deltaTime, gameObjects);
+            }
+        }
+    }
+
+
+    // Draw all game objects
+    for (const obj of gameObjects) {
+        obj.draw(ctx);
+    }
+
+    // Update UI
+    updateTopUI();
+    // Keep controls UI updated for progress bars etc. even if selection doesn't change
+    if(selectedObject) updateControlsUI();
+
+
+    // Game Over Check (done within destroy methods now)
+    if (gameOver) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.font = "48px sans-serif";
+        ctx.fillStyle = gameWon ? "lime" : "red";
+        ctx.textAlign = "center";
+        ctx.fillText(gameWon ? "YOU WIN!" : "GAME OVER", canvas.width / 2, canvas.height / 2);
+    } else {
+       // Only request next frame if game is not over
+       requestAnimationFrame(gameLoop);
+    }
+
+}
+
+// --- Initialization ---
+function init() {
+    canvas = document.getElementById('gameCanvas');
+    ctx = canvas.getContext('2d');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // Initial game objects
+    // Player
+    const playerBaseX = canvas.width * 0.2;
+    const playerBaseY = canvas.height * 0.8;
+    gameObjects.push(new Base(playerBaseX, playerBaseY, true));
+    gameObjects.push(new Worker(playerBaseX + BASE_SIZE, playerBaseY, true));
+    gameObjects.push(new Worker(playerBaseX - BASE_SIZE, playerBaseY, true));
+     gameObjects.push(new Worker(playerBaseX, playerBaseY + BASE_SIZE, true));
+
+
+    // Enemy AI
+     const enemyBaseX = canvas.width * 0.8;
+     const enemyBaseY = canvas.height * 0.2;
+     const enemyBase = new Base(enemyBaseX, enemyBaseY, false);
+    gameObjects.push(enemyBase);
+    gameObjects.push(new Worker(enemyBaseX + BASE_SIZE, enemyBaseY, false));
+     gameObjects.push(new Worker(enemyBaseX - BASE_SIZE, enemyBaseY, false));
+     gameObjects.push(new Worker(enemyBaseX, enemyBaseY - BASE_SIZE, false));
+     aiState.targetBase = gameObjects.find(o => o instanceof Base && o.isPlayer); // Set initial AI target
+
+
+    // Resources (add more variety)
+    // Mineral patches near bases
+     gameObjects.push(new ResourceNode(playerBaseX + 150, playerBaseY + 50, 'mineral', 1500));
+     gameObjects.push(new ResourceNode(playerBaseX - 150, playerBaseY - 50, 'mineral', 1500));
+     gameObjects.push(new ResourceNode(enemyBaseX + 150, enemyBaseY + 50, 'mineral', 1500));
+     gameObjects.push(new ResourceNode(enemyBaseX - 150, enemyBaseY - 50, 'mineral', 1500));
+     // Gas geysers further away
+     gameObjects.push(new ResourceNode(canvas.width * 0.3, canvas.height * 0.3, 'gas', 1000));
+     gameObjects.push(new ResourceNode(canvas.width * 0.7, canvas.height * 0.7, 'gas', 1000));
+     // Central contested resources
+      gameObjects.push(new ResourceNode(canvas.width * 0.5, canvas.height * 0.5 - 50, 'mineral', 2000));
+       gameObjects.push(new ResourceNode(canvas.width * 0.5, canvas.height * 0.5 + 50, 'gas', 1500));
+
+
+    // Add event listeners
+    canvas.addEventListener('click', handleClick);
+    canvas.addEventListener('contextmenu', handleRightClick);
+
+     // Set initial supply based on starting base(s)
+     maxSupply = gameObjects.filter(o => o instanceof Base && o.isPlayer).reduce((sum, b) => sum + b.supplyProvided, 0);
+     supply = gameObjects.filter(o => o instanceof Unit && o.isPlayer).reduce((sum, u) => sum + u.supplyCost, 0);
+     aiState.maxSupply = gameObjects.filter(o => o instanceof Base && !o.isPlayer).reduce((sum, b) => sum + b.supplyProvided, 0);
+     aiState.supply = gameObjects.filter(o => o instanceof Unit && !o.isPlayer).reduce((sum, u) => sum + u.supplyCost, 0);
+
+
+    // Start game loop
+    lastTimestamp = performance.now();
+    requestAnimationFrame(gameLoop);
+}
+
+// Start the game when the window loads
+window.onload = init;
+
+</script>
+
+</body>
+</html>
